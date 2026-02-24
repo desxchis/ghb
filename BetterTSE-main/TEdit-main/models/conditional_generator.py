@@ -247,3 +247,96 @@ class ConditionalGenerator(nn.Module):
             else:
                 xt = self.ddim.reverse(xt, pred_noise, t, noise, is_determin=True)
         return xt
+
+    def edit_soft(self, batch, n_samples, sampler="ddim", soft_mask=None):
+        """
+        Entry point: Execute local editing with soft boundary mask.
+        
+        Implements Noise/Score Blending for variance-preserving editing.
+        
+        Args:
+            batch: Data batch containing src_x, src_attrs, tgt_attrs, tp
+            n_samples: Number of samples to generate
+            sampler: Sampler type ("ddim" or "ddpm")
+            soft_mask: Soft boundary mask (numpy array, shape: [L])
+        
+        Returns:
+            torch.Tensor: Edited samples (n_samples, B, K, L)
+        """
+        src_x, tp, src_attrs, tgt_attrs, tgt_x = self._unpack_data_edit(batch)
+
+        side_emb = self.side_en(tp)
+        src_attr_emb = self.attr_en(src_attrs)
+        tgt_attr_emb = self.attr_en(tgt_attrs)
+
+        samples = []
+        for i in range(n_samples):
+            tgt_x_pred = self._edit_soft(src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask)
+            samples.append(tgt_x_pred)
+            
+        return torch.stack(samples)
+
+    @torch.no_grad()
+    def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask):
+        """
+        Core Innovation: Noise/Score Blending for Soft-Boundary Temporal Injection.
+        
+        Math formula:
+        ε_blend = M ⊙ ε_tgt + (1-M) ⊙ ε_src
+        
+        This preserves variance by blending at NOISE level, not LATENT level.
+        
+        Args:
+            src_x: Source time series (B, K, L)
+            side_emb: Side information embedding
+            src_attr_emb: Source attribute embedding
+            tgt_attr_emb: Target attribute embedding
+            sampler: Sampler type
+            soft_mask: Soft boundary mask (numpy array, shape: [L])
+        
+        Returns:
+            torch.Tensor: Edited time series (B, K, L)
+        """
+        B, K, L = src_x.shape
+
+        # Convert numpy mask to tensor with correct dimensions: (1, 1, L)
+        # This will broadcast correctly with (B, K, L) noise tensors
+        mask_tensor = torch.from_numpy(soft_mask).to(self.device).float()
+        mask_tensor = mask_tensor.view(1, 1, L)
+
+        # 1. Forward diffusion (Inversion: extract source structure)
+        xt = src_x
+        if sampler[:4] == "ddpm":
+            noise = torch.randn_like(src_x)
+            xt = self.ddpm.forward(xt, self.edit_steps - 1, noise=noise)
+        else:
+            for t in range(-1, self.edit_steps - 1):
+                if t == -1:
+                    pred_noise = 0
+                    t_tensor = (torch.ones(B, device=self.device) * 0).long()
+                else:
+                    t_tensor = (torch.ones(B, device=self.device) * t).long()
+                    pred_noise = self.predict_noise(xt, side_emb, src_attr_emb, t_tensor)
+                xt = self.ddim.forward(xt, pred_noise, t_tensor)
+
+        # 2. Reverse denoising with Score Blending
+        for t in range(self.edit_steps - 1, -1, -1):
+            noise = torch.randn_like(xt)
+            t_tensor = (torch.ones(B, device=self.device) * t).long()
+            
+            # Trajectory A: Predict noise under source condition (preserve background)
+            pred_noise_src = self.predict_noise(xt, side_emb, src_attr_emb, t_tensor)
+            
+            # Trajectory B: Predict noise under target condition (generate local edit)
+            pred_noise_tgt = self.predict_noise(xt, side_emb, tgt_attr_emb, t_tensor)
+            
+            # CORE: Blend at NOISE level (Score Blending)
+            pred_noise_blend = mask_tensor * pred_noise_tgt + (1.0 - mask_tensor) * pred_noise_src
+            
+            # CORE: Single reverse step (preserves variance)
+            if sampler[-4:] == "ddpm":
+                xt = self.ddpm.reverse(xt, pred_noise_blend, t_tensor, noise)
+            else:
+                xt = self.ddim.reverse(xt, pred_noise_blend, t_tensor, noise, is_determin=True)
+                
+        return xt
