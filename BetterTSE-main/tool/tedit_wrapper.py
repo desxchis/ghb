@@ -2,6 +2,11 @@
 
 This module provides a unified interface to integrate TEdit (NeurIPS 2024)
 diffusion-based time series editing model into the BetterTSE workflow.
+
+Key Innovation: Soft-Boundary Temporal Injection
+- Replaces hard array splicing with latent space blending
+- Eliminates "cliff effect" at region boundaries
+- Training-free attention region injection inspired by RePlan
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.ndimage import gaussian_filter1d
 
 
 class TEditWrapper:
@@ -283,6 +289,116 @@ class TEditWrapper:
         """
         if self.model is not None:
             self.model.edit_steps = steps
+
+    def _generate_soft_mask(
+        self,
+        length: int,
+        start_idx: int,
+        end_idx: int,
+        smooth_radius: float = 5.0,
+    ) -> np.ndarray:
+        """Generate a soft boundary mask using Gaussian smoothing.
+
+        This creates a smooth transition from 0 to 1 at the region boundaries,
+        eliminating the "cliff effect" that occurs with hard masks.
+
+        Args:
+            length: Total length of the time series
+            start_idx: Start index of the edit region
+            end_idx: End index of the edit region
+            smooth_radius: Standard deviation for Gaussian kernel (default: 5.0)
+
+        Returns:
+            Soft mask array with values in [0, 1], shape: [length]
+        """
+        hard_mask = np.zeros(length, dtype=np.float32)
+        hard_mask[start_idx:end_idx] = 1.0
+        
+        soft_mask = gaussian_filter1d(hard_mask, sigma=smooth_radius)
+        
+        return soft_mask
+
+    def edit_region_soft(
+        self,
+        ts: np.ndarray,
+        start_idx: int,
+        end_idx: int,
+        src_attrs: np.ndarray,
+        tgt_attrs: np.ndarray,
+        n_samples: int = 1,
+        sampler: str = "ddim",
+        smooth_radius: float = 3.0,
+    ) -> np.ndarray:
+        """Edit a specific region using Soft-Boundary Temporal Injection.
+
+        Implements Noise/Score Blending for variance-preserving editing:
+        ε_blend = M ⊙ ε_tgt + (1-M) ⊙ ε_src
+
+        Key Innovation:
+        - Traditional: result[start:end] = edited_region (hard splicing)
+        - This method: Noise Blending with soft mask (variance preserved)
+
+        Args:
+            ts: Input time series (shape: [L] or [B, L])
+            start_idx: Start index of region to edit (inclusive)
+            end_idx: End index of region to edit (exclusive)
+            src_attrs: Source attributes for background
+            tgt_attrs: Target attributes for edit region
+            n_samples: Number of samples to generate
+            sampler: Sampler type ("ddim" or "ddpm")
+            smooth_radius: Radius for soft boundary smoothing (default: 3.0)
+
+        Returns:
+            Edited time series with smooth boundaries and preserved variance
+        """
+        if not self.is_loaded or self.model is None:
+            raise RuntimeError("TEdit model is not loaded. Call load_model() first.")
+
+        ts_array = np.asarray(ts, dtype=np.float32)
+        if ts_array.ndim == 1:
+            ts_array = ts_array.reshape(1, -1)
+
+        B, L = ts_array.shape
+
+        start_idx = max(0, start_idx)
+        end_idx = min(L, end_idx)
+        if start_idx >= end_idx:
+            raise ValueError(f"Invalid region indices: [{start_idx}, {end_idx})")
+
+        hard_mask = np.zeros(L, dtype=np.float32)
+        hard_mask[start_idx:end_idx] = 1.0
+        soft_mask = gaussian_filter1d(hard_mask, sigma=smooth_radius)
+
+        src_attrs_array = np.asarray(src_attrs, dtype=np.int64)
+        tgt_attrs_array = np.asarray(tgt_attrs, dtype=np.int64)
+
+        with torch.no_grad():
+            x = torch.from_numpy(ts_array).unsqueeze(1).to(self.device)
+            
+            src_attrs_tensor = torch.from_numpy(src_attrs_array).unsqueeze(0).repeat(B, 1).to(self.device)
+            tgt_attrs_tensor = torch.from_numpy(tgt_attrs_array).unsqueeze(0).repeat(B, 1).to(self.device)
+            tp = torch.zeros(B, L, device=self.device)
+
+            batch = {
+                "src_x": x.permute(0, 2, 1),
+                "src_attrs": src_attrs_tensor,
+                "tgt_attrs": tgt_attrs_tensor,
+                "tgt_x": x.permute(0, 2, 1),
+                "tp": tp,
+            }
+
+            samples = self.model.edit_soft(
+                batch,
+                n_samples=n_samples,
+                sampler=sampler,
+                soft_mask=soft_mask
+            )
+
+        edited_ts = samples.cpu().numpy().squeeze(1)
+        
+        if np.asarray(ts).ndim == 1:
+            return edited_ts[0]
+        return edited_ts
 
 
 _tedit_instance: Optional[TEditWrapper] = None
